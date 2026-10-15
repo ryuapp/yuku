@@ -788,10 +788,10 @@ pub const Lexer = struct {
             return error.InvalidUnicodeEscape;
         switch (context) {
             .identifier_start => {
-                if (!util.UnicodeId.canStartId(parsed.value)) return error.InvalidIdentifierStart;
+                if (!identifierStartCodePoint(parsed.value)) return error.InvalidIdentifierStart;
             },
             .identifier_continue => {
-                if (!util.UnicodeId.canContinueId(parsed.value)) {
+                if (!identifierContinueCodePoint(parsed.value)) {
                     return error.InvalidIdentifierContinue;
                 }
             },
@@ -837,6 +837,22 @@ pub const Lexer = struct {
         break :blk t;
     };
 
+    inline fn identifierStartCodePoint(code_point: u21) bool {
+        std.debug.assert(code_point <= 0x10ffff);
+        if (code_point < 0x80) return ident_start_table_ascii[code_point];
+        std.debug.assert(code_point >= 0x80);
+        return util.UnicodeId.canStartId(code_point);
+    }
+
+    inline fn identifierContinueCodePoint(code_point: u21) bool {
+        std.debug.assert(code_point <= 0x10ffff);
+        if (code_point < 0x80) return ident_continue_table_ascii[code_point];
+        // join controls belong to IdentifierPart even though Unicode excludes them
+        std.debug.assert(code_point >= 0x80);
+        if (code_point == 0x200c or code_point == 0x200d) return true;
+        return util.UnicodeId.canContinueId(code_point);
+    }
+
     fn scanIdentifierBody(self: *Lexer, is_jsx_tag: bool) !bool {
         std.debug.assert(self.cursor <= self.source.len);
         const table = if (is_jsx_tag)
@@ -868,7 +884,7 @@ pub const Lexer = struct {
                 @branchHint(.cold);
                 self.cursor = pos;
                 const cp = try util.Utf.codePointAt(src, pos);
-                if (util.UnicodeId.canContinueId(cp.value)) {
+                if (identifierContinueCodePoint(cp.value)) {
                     pos += cp.len;
                     continue;
                 }
@@ -909,7 +925,7 @@ pub const Lexer = struct {
         } else {
             @branchHint(.cold);
             const cp = try util.Utf.codePointAt(self.source, self.cursor);
-            if (!util.UnicodeId.canStartId(cp.value)) return error.InvalidIdentifierStart;
+            if (!identifierStartCodePoint(cp.value)) return error.InvalidIdentifierStart;
             self.cursor += cp.len;
             has_escape = try self.scanIdentifierBody(is_jsx_tag);
         }

@@ -348,7 +348,7 @@ fn validateForInOfDeclarators(
     for (parser.tree.extra(declarators)) |declarator| {
         const data = parser.tree.data(declarator).variable_declarator;
         if (data.init == .null) continue;
-        if (ecmascript.isAnnexBForInHead(&parser.tree, kind, data.id, is_for_in)) continue;
+        if (ecmascript.isAnnexBForInHead(parser.tree, kind, data.id, is_for_in)) continue;
 
         try parser.report(
             parser.tree.span(declarator),

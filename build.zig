@@ -179,6 +179,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "parser", .module = parser_module }},
     });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{
+        .root_module = ast_transfer_module,
+    })).step);
 
     const package_files = b.addUpdateSourceFiles();
     package_files.addCopyFileToSource(

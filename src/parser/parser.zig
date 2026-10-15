@@ -7,6 +7,8 @@ const ast = @import("ast.zig");
 const util = @import("util");
 
 const statements = @import("syntax/statements.zig");
+const expressions = @import("syntax/expressions.zig");
+const Precedence = @import("token.zig").Precedence;
 const grammar = @import("grammar.zig");
 const dialect = @import("dialect.zig");
 const comments = @import("comments.zig");
@@ -40,8 +42,46 @@ pub const Options = struct {
     comments: CommentMode = .flat,
     /// Whether to keep every consumed token in `Tree.tokens`.
     tokens: bool = false,
+    /// Whether return statements are allowed at module or script scope.
+    allow_return_outside_function: bool = false,
+    /// An optional reader for foreign markup in JSX expression position.
+    markup: ?MarkupHandler = null,
+    /// Maximum active expression nesting. Must be between 1 and 512 inclusive.
+    expression_depth_max: u16 = 512,
     /// Whether the dialect compiled into the parser reads this source.
     dialect: bool = false,
+};
+
+/// Reads markup before the built-in JSX reader. A null result declines without mutation.
+/// A successful reader adds its expression node and resumes tokenization with `resumeAt`.
+/// Checkpoint and rewind must either both be supplied or both be null.
+pub const MarkupHandler = struct {
+    context: *anyopaque,
+    parse: *const fn (*anyopaque, *Parser) Error!?ast.NodeIndex,
+    checkpoint: ?*const fn (*anyopaque) u32 = null,
+    rewind: ?*const fn (*anyopaque, u32) void = null,
+};
+
+/// Controls a single expression parsed directly from an original source range.
+pub const ExpressionOptions = struct {
+    options: Options = .{},
+    start: u32 = 0,
+    end: ?u32 = null,
+    terminator: ?TokenTag = null,
+    allow_empty: bool = false,
+    /// Preserve a missing operand before `}` as an empty identifier plus a diagnostic.
+    recover_missing_rhs: bool = false,
+    min_precedence: u8 = Precedence.Lowest,
+    context: ?Context = null,
+};
+
+/// Owns an expression tree and describes its unconsumed following token.
+pub const ExpressionResult = struct {
+    tree: ast.Tree,
+    /// The end of the last consumed token. Trailing trivia is excluded.
+    end: u32,
+    /// The following token. Its start is the delimiter offset after trivia.
+    next: Token,
 };
 
 pub const Context = packed struct {
@@ -73,27 +113,55 @@ pub const TsContext = packed struct {
 };
 
 const ParserState = struct {
+    expression_depth: u16 = 0,
+    type_depth: u16 = 0,
+    type_prefix_depth: u16 = 0,
+    recover_missing_rhs: bool = false,
+    recovery_depth: u16 = 0,
     // `{ a = 1 }` defaults not yet part of a pattern, any left at the end are errors
     cover_init_names: u32 = 0,
     // `(a) = b` is legal, but the same node is a syntax error in binding position
     stripped_paren: ?ast.NodeIndex = null,
 };
 
+pub const RangeState = struct {
+    source_end: u32,
+    cursor: u32,
+    lexer_state: lexer.LexerState,
+    mode: lexer.LexerMode,
+    hashbang: @FieldType(lexer.Lexer, "hashbang"),
+    range_start: u32,
+    current_token: Token,
+    prev_token_end: u32,
+    lang: ast.Lang,
+    allow_return: bool,
+    context: Context,
+    ts_context: TsContext,
+    state: ParserState,
+};
+
 pub const Error = error{OutOfMemory};
 
 pub const Parser = struct {
-    tree: ast.Tree,
+    tree: *ast.Tree = undefined,
+    owned_tree: ast.Tree = undefined,
+    owns_tree: bool = false,
     source: []const u8,
     source_type: ast.SourceType,
     lang: ast.Lang,
     preserve_parens: bool,
     comment_mode: CommentMode,
     collect_tokens: bool,
+    allow_return_outside_function: bool,
+    markup: ?MarkupHandler,
+    expression_depth_max: u16,
+    initialized: bool = false,
+    range_start: u32 = 0,
     dialect: bool,
     lexer: lexer.Lexer,
-    diagnostics: std.ArrayList(ast.Diagnostic) = .empty,
+    diagnostics: *std.ArrayList(ast.Diagnostic) = undefined,
     // the tokens the committed parse advanced past, `current_token` is never in it
-    tokens: std.ArrayList(Token) = .empty,
+    tokens: *std.ArrayList(Token) = undefined,
 
     current_token: Token,
     // spans must stop at a consumed delimiter, not at the next token past trivia
@@ -114,56 +182,315 @@ pub const Parser = struct {
     ts_rejected_speculations: std.AutoHashMapUnmanaged(u32, void) = .empty,
 
     pub fn init(child_allocator: std.mem.Allocator, source: []const u8, options: Options) Parser {
+        var parser = initOptions(source, options);
+        parser.owned_tree = ast.Tree.init(child_allocator, source);
+        parser.owned_tree.source_type = options.source_type;
+        parser.owned_tree.lang = options.lang;
+        parser.owns_tree = true;
+        return parser;
+    }
+
+    fn initOptions(source: []const u8, options: Options) Parser {
+        std.debug.assert(source.len <= std.math.maxInt(u32));
+        std.debug.assert(options.expression_depth_max > 0);
+        std.debug.assert(options.expression_depth_max <= 512);
+        if (options.markup) |handler| {
+            std.debug.assert((handler.checkpoint == null) == (handler.rewind == null));
+        }
         if (options.dialect) std.debug.assert(dialect.bound);
-        var tree = ast.Tree.init(child_allocator, source);
-        tree.source_type = options.source_type;
-        tree.lang = options.lang;
         return .{
-            .tree = tree,
             .source = source,
             .source_type = options.source_type,
             .lang = options.lang,
             .preserve_parens = options.preserve_parens,
             .comment_mode = options.comments,
             .collect_tokens = options.tokens,
+            .allow_return_outside_function = options.allow_return_outside_function,
+            .markup = options.markup,
+            .expression_depth_max = options.expression_depth_max,
             .dialect = options.dialect,
             .lexer = undefined,
             .current_token = Token.eof(0),
         };
     }
 
+    fn bindTree(self: *Parser) void {
+        if (self.owns_tree) self.tree = &self.owned_tree;
+        self.diagnostics = &self.tree.diagnostics;
+        self.tokens = &self.tree.token_buffer;
+    }
+
+    /// Initializes independent grammar state over document-owned AST storage.
+    /// The caller owns the tree, arena and source. This parser never frees them.
+    pub fn initInTree(
+        self: *Parser,
+        tree: *ast.Tree,
+        options: Options,
+        range: ast.Span,
+    ) Error!void {
+        std.debug.assert(tree.arena == null);
+        std.debug.assert(tree.borrowed_allocator != null);
+        std.debug.assert(options.source_type == tree.source_type);
+        std.debug.assert(options.preserve_parens);
+        std.debug.assert(!options.comments.attaches());
+        self.* = initOptions(tree.source, options);
+        self.tree = tree;
+        self.bindTree();
+        try self.initialize(range, range.end - range.start);
+    }
+
+    pub inline fn isTs(self: *const Parser) bool {
+        return self.lang == .ts or self.lang == .tsx or self.lang == .dts;
+    }
+
+    pub inline fn isJsx(self: *const Parser) bool {
+        return self.lang == .jsx or self.lang == .tsx;
+    }
+
+    pub inline fn isModule(self: *const Parser) bool {
+        return self.source_type == .module;
+    }
+
     pub inline fn allocator(self: *Parser) std.mem.Allocator {
         return self.tree.allocator();
     }
 
-    pub fn parse(self: *Parser) Error!ast.Tree {
-        try self.parseInner();
-        return self.tree;
+    /// Initializes an owned parse session over a bounded range of the original source.
+    /// Call `deinit` or transfer ownership through `finish` or `parse` exactly once.
+    pub fn initSession(
+        self: *Parser,
+        child_allocator: std.mem.Allocator,
+        source: []const u8,
+        options: Options,
+        range: ast.Span,
+    ) Error!void {
+        std.debug.assert(range.start <= range.end);
+        std.debug.assert(range.end <= source.len);
+        self.* = Parser.init(child_allocator, source, options);
+        self.bindTree();
+        errdefer self.tree.deinit();
+        try self.initialize(range, range.end - range.start);
+        std.debug.assert(self.initialized);
+        std.debug.assert(self.current_token.span.end <= range.end);
     }
 
-    fn parseInner(self: *Parser) Error!void {
-        errdefer self.tree.arena.deinit();
+    /// Releases an abandoned parser. Document-backed storage remains caller-owned.
+    pub fn deinit(self: *Parser) void {
+        if (self.owns_tree) self.tree.deinit();
+        self.initialized = false;
+    }
 
+    fn initialize(self: *Parser, range: ast.Span, capacity_source_bytes: u32) Error!void {
+        std.debug.assert(!self.initialized);
+        std.debug.assert(range.start <= range.end);
+        std.debug.assert(range.end <= self.source.len);
+        std.debug.assert(capacity_source_bytes <= range.end - range.start);
         self.lexer = lexer.Lexer.init(
-            self.source,
+            self.source[0..range.end],
             self.allocator(),
             self.source_type,
             self.comment_mode.collects(),
         );
-
-        // ScriptBody is [~Yield, ~Await, ~Return], ModuleItemList is [+Await], and a
-        // commonjs body is [+Return]
+        if (range.start > 0) {
+            self.lexer.cursor = range.start;
+            self.lexer.hashbang = null;
+        }
+        self.range_start = range.start;
+        self.current_token = Token.eof(range.start);
         self.context.yield = false;
-        self.context.await = self.tree.isModule();
-        self.context.@"return" = self.source_type == .commonjs;
-
+        self.context.await = self.isModule();
+        self.context.@"return" = self.source_type == .commonjs or
+            self.allow_return_outside_function;
         self.ts_context.ambient = self.lang == .dts;
 
         try self.advance() orelse {
             self.current_token = try self.recoverNextToken();
         };
+        try self.ensureCapacity(capacity_source_bytes);
+        self.initialized = true;
+        std.debug.assert(self.lexer.cursor <= range.end);
+        std.debug.assert(self.current_token.span.end <= range.end);
+    }
 
-        try self.ensureCapacity();
+    /// Parses an expression in this session without a synthetic statement or program.
+    pub fn parseExpressionNode(self: *Parser, min_precedence: u8) Error!?ast.NodeIndex {
+        std.debug.assert(self.initialized);
+        std.debug.assert(min_precedence <= Precedence.Grouping);
+        return expressions.parseExpression(self, min_precedence, .{ .respect_allow_in = true });
+    }
+
+    /// Saves lexical and grammar state while a nested range appends to the same tree.
+    /// Restore this state with `leaveRange`. Allocated nodes and metadata remain committed.
+    pub fn enterRange(self: *Parser, range: ast.Span, options: Options) Error!RangeState {
+        std.debug.assert(self.initialized);
+        std.debug.assert(range.start <= range.end);
+        std.debug.assert(range.end <= self.source.len);
+        std.debug.assert(options.source_type == self.source_type);
+        std.debug.assert(options.comments == self.comment_mode);
+        std.debug.assert(options.tokens == self.collect_tokens);
+        std.debug.assert(options.dialect == self.dialect);
+        const saved: RangeState = .{
+            .source_end = @intCast(self.lexer.source.len),
+            .cursor = self.lexer.cursor,
+            .lexer_state = self.lexer.state,
+            .mode = self.lexer.mode,
+            .hashbang = self.lexer.hashbang,
+            .range_start = self.range_start,
+            .current_token = self.current_token,
+            .prev_token_end = self.prev_token_end,
+            .lang = self.lang,
+            .allow_return = self.allow_return_outside_function,
+            .context = self.context,
+            .ts_context = self.ts_context,
+            .state = self.state,
+        };
+        self.lexer.source = self.source[0..range.end];
+        self.lexer.cursor = range.start;
+        self.lexer.state = .{};
+        self.lexer.mode = .normal;
+        self.lexer.hashbang = null;
+        self.range_start = range.start;
+        self.prev_token_end = range.start;
+        self.current_token = Token.eof(range.start);
+        self.lang = options.lang;
+        self.allow_return_outside_function = options.allow_return_outside_function;
+        self.context = .{
+            .await = self.isModule(),
+            .@"return" = self.allow_return_outside_function,
+        };
+        self.ts_context = .{ .ambient = self.lang == .dts };
+        self.state = .{ .expression_depth = saved.state.expression_depth };
+        errdefer self.leaveRange(&saved);
+        if (!try self.nextTokenInto(&self.current_token)) {
+            self.current_token = try self.recoverNextToken();
+        }
+        std.debug.assert(self.current_token.span.end <= range.end);
+        return saved;
+    }
+
+    /// Restores the enclosing range without discarding the nested parse result.
+    pub fn leaveRange(self: *Parser, saved: *const RangeState) void {
+        std.debug.assert(self.initialized);
+        std.debug.assert(saved.source_end <= self.source.len);
+        self.lexer.source = self.source[0..saved.source_end];
+        self.lexer.cursor = saved.cursor;
+        self.lexer.state = saved.lexer_state;
+        self.lexer.mode = saved.mode;
+        self.lexer.hashbang = saved.hashbang;
+        self.range_start = saved.range_start;
+        self.current_token = saved.current_token;
+        self.prev_token_end = saved.prev_token_end;
+        self.lang = saved.lang;
+        self.allow_return_outside_function = saved.allow_return;
+        self.context = saved.context;
+        self.ts_context = saved.ts_context;
+        self.state = saved.state;
+    }
+
+    /// Parses a program in the active range without finalizing the document tree.
+    pub fn parseProgramNode(self: *Parser) Error!ast.NodeIndex {
+        std.debug.assert(self.initialized);
+        const body = try self.parseBody(null, .program);
+        if (self.state.cover_init_names > 0) try grammar.reportCoverInitializedNames(self);
+        std.debug.assert(self.current_token.tag == .eof);
+        try self.commitEof();
+        return self.tree.addNode(.{ .program = .{
+            .source_type = if (self.source_type == .module) .module else .script,
+            .body = body,
+            .hashbang = null,
+        } }, .{ .start = self.range_start, .end = self.current_token.span.end });
+    }
+
+    /// Parses a delimited expression in the active range without finalizing its tree.
+    pub fn parseDelimitedExpression(
+        self: *Parser,
+        options: *const ExpressionOptions,
+    ) Error!ast.NodeIndex {
+        std.debug.assert(self.initialized);
+        std.debug.assert(options.start == self.range_start);
+        if (options.end) |end| std.debug.assert(end == self.lexer.source.len);
+        if (options.context) |context| self.context = context;
+        self.state.recover_missing_rhs = options.recover_missing_rhs;
+        var root: ast.NodeIndex = .null;
+        if (self.current_token.tag != (options.terminator orelse .eof) or !options.allow_empty) {
+            root = try self.parseExpressionNode(options.min_precedence) orelse .null;
+        }
+        if (self.state.cover_init_names > 0) try grammar.reportCoverInitializedNames(self);
+        if (self.current_token.tag != (options.terminator orelse .eof)) {
+            try self.reportExpected(self.current_token.span, "Expected expression delimiter", .{});
+        }
+        if (root != .null) std.debug.assert(@backingInt(root) < self.tree.nodes.len);
+        return root;
+    }
+
+    /// Parses a TypeScript `<T, U>` list at the current token, retaining source offsets.
+    /// Fused closing tokens are peeled. The following token remains current.
+    pub fn parseTypeArgumentsNode(self: *Parser) Error!ast.NodeIndex {
+        std.debug.assert(self.initialized);
+        std.debug.assert(self.isTs());
+        return @import("syntax/ts/types.zig").parseTypeArguments(self);
+    }
+
+    /// Resumes after foreign markup without tokenizing its interior.
+    /// The current token is replaced. Foreign bytes are absent from the token stream.
+    pub fn resumeAt(self: *Parser, offset: u32, mode: lexer.LexerMode) Error!?void {
+        std.debug.assert(self.initialized);
+        std.debug.assert(offset >= self.current_token.span.start);
+        std.debug.assert(offset <= self.lexer.source.len);
+        self.lexer.rewindTo(offset);
+        self.lexer.mode = mode;
+        self.prev_token_end = offset;
+        self.current_token = Token.eof(offset);
+        if (!try self.nextTokenInto(&self.current_token)) {
+            self.current_token = Token.invalid(self.lexer.cursor);
+            return null;
+        }
+        std.debug.assert(self.current_token.span.start >= offset);
+        std.debug.assert(self.current_token.span.end <= self.lexer.source.len);
+    }
+
+    /// Finalizes metadata and returns a view rooted at `root`.
+    /// Owned parses transfer their arena. Borrowed storage stays with the document.
+    pub fn finish(self: *Parser, root: ast.NodeIndex) Error!ast.Tree {
+        std.debug.assert(self.initialized);
+        if (root != .null) std.debug.assert(@backingInt(root) < self.tree.nodes.len);
+        if (self.owns_tree) self.tree.root = root;
+        if (!self.preserve_parens) stripParenthesizedNodes(self.tree);
+        if (self.comment_mode.attaches()) {
+            if (root != .null) try comments.attach(self.tree, self.lexer.comments.items);
+        }
+        if (self.comment_mode.isFlat()) {
+            if (self.owns_tree) {
+                self.tree.comments = self.lexer.comments.items;
+            } else {
+                try self.tree.flat_comments.appendSlice(
+                    self.allocator(),
+                    self.lexer.comments.items,
+                );
+                self.tree.comments = self.tree.flat_comments.items;
+            }
+        }
+        if (self.collect_tokens) self.tree.tokens = self.tokens.items;
+        self.initialized = false;
+        var result = self.tree.*;
+        result.root = root;
+        result.lang = self.lang;
+        result.source_type = self.source_type;
+        return result;
+    }
+
+    pub fn parse(self: *Parser) Error!ast.Tree {
+        return self.parseInner();
+    }
+
+    fn parseInner(self: *Parser) Error!ast.Tree {
+        if (!self.initialized) self.bindTree();
+        errdefer self.deinit();
+
+        if (!self.initialized) {
+            const source_len: u32 = @intCast(self.source.len);
+            try self.initialize(.{ .start = 0, .end = source_len }, source_len);
+        }
 
         const body = try self.parseBody(null, .program);
         if (self.state.cover_init_names > 0) try grammar.reportCoverInitializedNames(self);
@@ -171,7 +498,7 @@ pub const Parser = struct {
         std.debug.assert(self.current_token.tag == .eof);
         try self.commitEof();
 
-        self.tree.root = try self.tree.addNode(
+        const root = try self.tree.addNode(
             .{
                 .program = .{
                     .source_type = if (self.source_type == .module) .module else .script,
@@ -181,15 +508,9 @@ pub const Parser = struct {
                     } else null,
                 },
             },
-            .{ .start = 0, .end = self.current_token.span.end },
+            .{ .start = self.range_start, .end = self.current_token.span.end },
         );
-
-        self.tree.diagnostics = self.diagnostics;
-        if (!self.preserve_parens) stripParenthesizedNodes(&self.tree);
-        const raw_comments = self.lexer.comments.items;
-        if (self.comment_mode.attaches()) try comments.attach(&self.tree, raw_comments);
-        if (self.comment_mode.isFlat()) self.tree.comments = raw_comments;
-        if (self.collect_tokens) self.tree.tokens = self.tokens.items;
+        return self.finish(root);
     }
 
     inline fn commitToken(self: *Parser, token: Token) Error!void {
@@ -329,7 +650,7 @@ pub const Parser = struct {
         @branchHint(.cold);
         const cursor = self.lexer.cursor;
         try self.report(
-            .{ .start = cursor, .end = @min(cursor + 1, self.source.len) },
+            .{ .start = cursor, .end = @min(cursor +| 1, self.lexer.source.len) },
             lexer.getLexicalErrorMessage(lex_err),
             .{ .help = lexer.getLexicalErrorHelp(lex_err) },
         );
@@ -384,6 +705,7 @@ pub const Parser = struct {
             .lexer_state = self.lexer.state,
             .lexer_mode = self.lexer.mode,
             .lexer_comments_len = self.lexer.comments.items.len,
+            .flat_comments_len = self.tree.flat_comments.items.len,
             .current_token = self.current_token,
             .prev_token_end = self.prev_token_end,
             .nodes_len = self.tree.nodes.len,
@@ -393,6 +715,10 @@ pub const Parser = struct {
             .context = self.context,
             .ts_context = self.ts_context,
             .state = self.state,
+            .markup_checkpoint = if (self.markup) |handler|
+                if (handler.checkpoint) |capture| capture(handler.context) else null
+            else
+                null,
         };
     }
 
@@ -402,15 +728,24 @@ pub const Parser = struct {
         self.lexer.state = cp.lexer_state;
         self.lexer.mode = cp.lexer_mode;
         self.lexer.comments.shrinkRetainingCapacity(cp.lexer_comments_len);
+        self.tree.flat_comments.shrinkRetainingCapacity(cp.flat_comments_len);
         self.current_token = cp.current_token;
         self.prev_token_end = cp.prev_token_end;
         self.tree.nodes.shrinkRetainingCapacity(cp.nodes_len);
         self.tree.extras.shrinkRetainingCapacity(cp.extras_len);
         self.diagnostics.shrinkRetainingCapacity(cp.diagnostics_len);
         self.tokens.shrinkRetainingCapacity(cp.tokens_len);
+        if (!self.owns_tree) {
+            self.tree.comments = self.tree.flat_comments.items;
+            self.tree.tokens = self.tokens.items;
+        }
         self.context = cp.context;
         self.ts_context = cp.ts_context;
         self.state = cp.state;
+        if (cp.markup_checkpoint) |marker| {
+            const handler = self.markup.?;
+            handler.rewind.?(handler.context, marker);
+        }
     }
 
     pub const Peek = struct {
@@ -605,21 +940,21 @@ pub const Parser = struct {
         while (true) {
             return self.lexer.nextToken() catch |e| {
                 if (e == error.OutOfMemory) return error.OutOfMemory;
-                if (self.lexer.cursor < self.source.len) {
+                if (self.lexer.cursor < self.lexer.source.len) {
                     self.lexer.cursor += 1;
                 } else {
-                    return Token.eof(@intCast(self.source.len));
+                    return Token.eof(@intCast(self.lexer.source.len));
                 }
                 continue;
             };
         }
     }
 
-    fn ensureCapacity(self: *Parser) Error!void {
+    fn ensureCapacity(self: *Parser, source_bytes: u32) Error!void {
         if (self.tree.nodes.capacity > 0) return;
 
         const alloc = self.allocator();
-        const source_len = self.source.len;
+        const source_len: usize = source_bytes;
 
         const estimated_nodes = if (source_len < 512_000)
             @max(256, source_len / 2)
@@ -649,6 +984,7 @@ pub const Checkpoint = struct {
     lexer_state: lexer.LexerState,
     lexer_mode: lexer.LexerMode,
     lexer_comments_len: usize,
+    flat_comments_len: usize,
 
     current_token: Token,
     prev_token_end: u32,
@@ -661,6 +997,7 @@ pub const Checkpoint = struct {
     context: Context,
     ts_context: TsContext,
     state: ParserState,
+    markup_checkpoint: ?u32,
 };
 
 const ScratchBuffer = struct {
@@ -695,4 +1032,66 @@ pub fn parse(
 ) Error!ast.Tree {
     var p = Parser.init(child_allocator, source, options);
     return p.parse();
+}
+
+/// Parses a program range while retaining original source positions and module options.
+pub fn parseProgramRange(
+    child_allocator: std.mem.Allocator,
+    source: []const u8,
+    options: Options,
+    range: ast.Span,
+) Error!ast.Tree {
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= source.len);
+    var parser: Parser = undefined;
+    try parser.initSession(child_allocator, source, options, range);
+    return parser.parse();
+}
+
+/// Parses one expression without a wrapper. Byte spans refer to the original source.
+/// The following token remains unconsumed and is excluded from the committed tokens.
+pub fn parseExpression(
+    child_allocator: std.mem.Allocator,
+    source: []const u8,
+    options: ExpressionOptions,
+) Error!ExpressionResult {
+    std.debug.assert(source.len <= std.math.maxInt(u32));
+    const end = options.end orelse @as(u32, @intCast(source.len));
+    std.debug.assert(options.start <= end);
+    std.debug.assert(end <= source.len);
+    var parser = Parser.init(child_allocator, source, options.options);
+    parser.bindTree();
+    errdefer parser.deinit();
+    try parser.initialize(.{
+        .start = options.start,
+        .end = end,
+    }, @min(end - options.start, 512));
+    if (options.context) |context| parser.context = context;
+    parser.state.recover_missing_rhs = options.recover_missing_rhs;
+
+    var root: ast.NodeIndex = .null;
+    const empty = parser.current_token.tag == (options.terminator orelse .eof);
+    if (!empty or !options.allow_empty) {
+        root = try parser.parseExpressionNode(options.min_precedence) orelse .null;
+    }
+    if (parser.state.cover_init_names > 0) try grammar.reportCoverInitializedNames(&parser);
+    if (options.terminator) |terminator| {
+        if (parser.current_token.tag != terminator) {
+            try parser.reportExpected(
+                parser.current_token.span,
+                "Expected expression delimiter",
+                .{},
+            );
+        }
+    } else {
+        if (parser.current_token.tag != .eof) {
+            try parser.reportExpected(parser.current_token.span, "Expected end of expression", .{});
+        }
+    }
+    const consumed_end = parser.prev_token_end;
+    const next = parser.current_token;
+    const tree = try parser.finish(root);
+    std.debug.assert(consumed_end >= options.start);
+    std.debug.assert(next.span.end <= end);
+    return .{ .tree = tree, .end = consumed_end, .next = next };
 }

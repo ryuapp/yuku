@@ -312,7 +312,7 @@ pub inline fn validateIdentifier(
         );
     }
 
-    if (token.tag == .await and (parser.context.await or parser.tree.isModule())) {
+    if (token.tag == .await and (parser.context.await or parser.isModule())) {
         try parser.report(
             token.span,
             "'await' is reserved in an async/module context and cannot be used as " ++ as_what,

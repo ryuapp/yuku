@@ -15,7 +15,25 @@ const literal = @import("literal.zig");
 const object = @import("object.zig");
 const predicate = @import("predicate.zig");
 
+const type_depth_max: u16 = 64;
+
+fn enterTypeDepth(parser: *Parser, depth: *u16) Error!bool {
+    std.debug.assert(depth.* <= type_depth_max);
+    if (depth.* == type_depth_max) {
+        try parser.report(parser.current_token.span, "Type nesting exceeds parser limit", .{});
+        return false;
+    }
+    depth.* += 1;
+    std.debug.assert(depth.* > 0);
+    return true;
+}
+
 pub fn parseType(parser: *Parser) Error!?ast.NodeIndex {
+    if (!try enterTypeDepth(parser, &parser.state.type_depth)) return null;
+    defer {
+        std.debug.assert(parser.state.type_depth > 0);
+        parser.state.type_depth -= 1;
+    }
     const saved = parser.ts_context.disallow_conditional_types;
     parser.ts_context.disallow_conditional_types = false;
     defer parser.ts_context.disallow_conditional_types = saved;
@@ -210,6 +228,11 @@ fn isPostfixNullable(parser: *Parser) bool {
 // string   42   Foo<T>   this is T   asserts x is T
 // ^^^^^^   ^^   ^^^^^^   ^^^^^^^^^   ^^^^^^^^^^^^^^
 fn parsePrimaryType(parser: *Parser) Error!?ast.NodeIndex {
+    if (!try enterTypeDepth(parser, &parser.state.type_prefix_depth)) return null;
+    defer {
+        std.debug.assert(parser.state.type_prefix_depth > 0);
+        parser.state.type_prefix_depth -= 1;
+    }
     const token = parser.current_token;
 
     switch (token.tag) {

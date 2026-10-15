@@ -241,9 +241,10 @@ pub fn bufferSize(tree: *const ast.Tree) usize {
 
 pub fn serializeInto(tree: *const ast.Tree, buf: []u8) usize {
     std.debug.assert(buf.len >= bufferSize(tree));
-    std.debug.assert(tree.root != .null);
     std.debug.assert(@intFromPtr(buf.ptr) % 4 == 0);
-    std.debug.assert(@backingInt(tree.root) + 1 == tree.nodes.len);
+    if (tree.root != .null) {
+        std.debug.assert(@backingInt(tree.root) + 1 == tree.nodes.len);
+    }
     if (builtin.optimize.runtimeSafety()) assertPostOrder(tree);
 
     const string_pool_len: u32 = @intCast(tree.strings.extra.items.len);
@@ -444,4 +445,46 @@ fn firstNonAsciiOffset(source: []const u8) usize {
     }
     for (source[i..], i..) |c, offset| if (c >= 0x80) return offset;
     return source.len;
+}
+
+// serialize empty and mixed-document forests without inventing a program root
+test "binary transfer preserves null forest roots and committed expression nodes" {
+    const parser = @import("parser");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const source = "alpha}beta}";
+    for ([_]u32{ 0, 2 }) |root_count| {
+        var session: parser.Parser = undefined;
+        var document = ast.Tree.initInArena(arena.allocator(), source);
+        try session.initInTree(&document, .{}, .{ .start = 0, .end = 0 });
+        defer if (session.initialized) session.deinit();
+        for (0..root_count) |index| {
+            const start: u32 = if (index == 0) 0 else 6;
+            const state = try session.enterRange(.{
+                .start = start,
+                .end = source.len,
+            }, .{});
+            const root = try session.parseDelimitedExpression(&.{
+                .start = start,
+                .terminator = .right_brace,
+            });
+            try std.testing.expect(root != .null);
+            session.leaveRange(&state);
+        }
+        var tree = try session.finish(.null);
+        defer tree.deinit();
+        try std.testing.expect(!tree.hasErrors());
+        try std.testing.expectEqual(root_count, tree.nodes.len);
+
+        const size = bufferSize(&tree);
+        const words = try std.testing.allocator.alloc(u32, std.math.divCeil(usize, size, 4) catch
+            unreachable);
+        defer std.testing.allocator.free(words);
+
+        const written = serializeInto(&tree, std.mem.sliceAsBytes(words)[0..size]);
+        try std.testing.expectEqual(size, written);
+        try std.testing.expectEqual(root_count, words[HDR_NODE_COUNT_U32]);
+        try std.testing.expectEqual(@backingInt(ast.NodeIndex.null), words[HDR_PROGRAM_INDEX_U32]);
+        try std.testing.expectEqual(source.len, words[HDR_SOURCE_LEN_U32]);
+    }
 }

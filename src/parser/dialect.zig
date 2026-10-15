@@ -171,7 +171,7 @@ pub const Parser = struct {
     inner: *core.Parser,
 
     pub inline fn tree(self: *const Parser) *ast.Tree {
-        return &self.inner.tree;
+        return self.inner.tree;
     }
 
     pub inline fn source(self: *const Parser) []const u8 {
@@ -246,7 +246,7 @@ pub const Parser = struct {
     /// Parses an identifier, array, or object pattern, with its type annotation in TypeScript.
     pub fn parseBindingPattern(self: *const Parser) Error!?ast.NodeIndex {
         const pattern = try patterns.parseBindingPattern(self.inner) orelse return null;
-        if (!self.inner.tree.isTs() or self.inner.current_token.tag != .colon) return pattern;
+        if (!self.inner.isTs() or self.inner.current_token.tag != .colon) return pattern;
         return ts.parsePatternTypeAnnotation(self.inner, pattern);
     }
 

@@ -14,6 +14,11 @@ const class = @import("../class.zig");
 
 const types = @import("types.zig");
 
+const enum_name_errors = [_][]const u8{
+    "Computed property names are not allowed in enums.",
+    "An enum member cannot have a numeric name.",
+};
+
 /// Declaration modifiers. `is_const` only applies to enums.
 pub const Modifiers = struct {
     declare: bool = false,
@@ -22,7 +27,7 @@ pub const Modifiers = struct {
 };
 
 pub fn isStartOfTsDeclaration(parser: *Parser) bool {
-    if (!parser.tree.isTs()) return false;
+    if (!parser.isTs()) return false;
 
     var peek = parser.beginPeek();
     defer peek.end();
@@ -409,6 +414,7 @@ fn parseEnumBody(parser: *Parser) Error!?ast.NodeIndex {
 }
 
 fn parseEnumMember(parser: *Parser) Error!?ast.NodeIndex {
+    const start = parser.current_token.span.start;
     const name = try parseEnumMemberName(parser) orelse return null;
     const id_span = parser.tree.span(name.id);
     var end = if (name.computed) parser.prev_token_end else id_span.end;
@@ -427,7 +433,7 @@ fn parseEnumMember(parser: *Parser) Error!?ast.NodeIndex {
             .initializer = initializer,
             .computed = name.computed,
         } },
-        .{ .start = id_span.start, .end = end },
+        .{ .start = start, .end = end },
     );
 }
 
@@ -440,7 +446,6 @@ fn parseEnumMemberName(parser: *Parser) Error!?EnumMemberName {
     const tag = parser.current_token.tag;
 
     if (tag == .left_bracket) {
-        const start = parser.current_token.span.start;
         try parser.advance() orelse return null;
         const inner = try expressions.parseExpression(parser, Precedence.Assignment, .{}) orelse
             return null;
@@ -450,21 +455,33 @@ fn parseEnumMemberName(parser: *Parser) Error!?EnumMemberName {
             "Each '[' in an enum member name must be matched by a ']'",
         )) return null;
 
-        try parser.report(
-            .{ .start = start, .end = parser.prev_token_end },
-            "Computed property names are not allowed in enums",
-            .{ .help = "Name the member with an identifier or a string literal." },
-        );
-
+        const data = parser.tree.data(inner);
+        if (data != .string_literal and
+            (data != .template_literal or data.template_literal.expressions.len != 0))
+        {
+            try parser.report(
+                parser.tree.span(inner),
+                enum_name_errors[@intFromBool(data == .numeric_literal)],
+                .{},
+            );
+            return null;
+        }
         return .{ .id = inner, .computed = true };
+    }
+
+    if (tag == .no_substitution_template or tag == .template_head or tag.isNumericLiteral()) {
+        try parser.report(
+            parser.current_token.span,
+            enum_name_errors[@intFromBool(tag.isNumericLiteral())],
+            .{},
+        );
+        return null;
     }
 
     const id = if (tag.isIdentifierLike())
         try literals.parseIdentifierName(parser) orelse return null
     else if (tag == .string_literal)
         try literals.parseStringLiteral(parser) orelse return null
-    else if (tag == .no_substitution_template)
-        try literals.parseNoSubstitutionTemplate(parser, false) orelse return null
     else {
         try parser.report(
             parser.current_token.span,

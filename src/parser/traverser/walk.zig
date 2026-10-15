@@ -140,7 +140,7 @@ noinline fn walkDeep(
     ctx: *C,
     root: ast.NodeIndex,
 ) Allocator.Error!Action {
-    const gpa = ctx.tree.arena.child_allocator;
+    const gpa = ctx.tree.scratchAllocator();
     var steps: std.ArrayList(WalkStep) = .empty;
     defer steps.deinit(gpa);
 

@@ -111,10 +111,10 @@ fn checkImportExportPosition(
     const messages = importExportMessages(parser.tree.data(node)) orelse return node;
     const span = parser.tree.span(node);
     std.debug.assert(span.start < span.end);
-    if (body == .module_block) std.debug.assert(parser.tree.isTs());
+    if (body == .module_block) std.debug.assert(parser.isTs());
 
     switch (body) {
-        .program => if (!parser.tree.isModule()) {
+        .program => if (!parser.isModule()) {
             try parser.report(span, messages.outside_module, .{});
         },
         .module_block => {},
@@ -261,7 +261,7 @@ fn parseTsDeclarationOrExpression(parser: *Parser) Error!?ast.NodeIndex {
 
 fn parseConstOrConstEnum(parser: *Parser) Error!?ast.NodeIndex {
     std.debug.assert(parser.current_token.tag == .@"const");
-    if (parser.tree.isTs()) {
+    if (parser.isTs()) {
         const next = parser.peekAhead();
         if (ts_decl.isConstEnumHead(next)) return ts_decl.parseTsDeclaration(parser);
     }
@@ -688,7 +688,7 @@ fn parseCatchClause(parser: *Parser) Error!?ast.NodeIndex {
         try parser.advance() orelse return null; // consume '('
         param = try patterns.parseBindingPattern(parser) orelse return null;
 
-        if (parser.tree.isTs() and parser.current_token.tag == .colon) {
+        if (parser.isTs() and parser.current_token.tag == .colon) {
             param = try ts_types.parsePatternTypeAnnotation(parser, param) orelse return null;
         }
 

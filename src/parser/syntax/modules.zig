@@ -23,7 +23,7 @@ pub fn parseImportDeclaration(parser: *Parser) Error!?ast.NodeIndex {
 // `start` lets `export public import x =` span from the legacy modifier
 pub fn parseImportDeclarationFrom(parser: *Parser, start: u32) Error!?ast.NodeIndex {
     std.debug.assert(parser.current_token.tag == .import);
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
     try parser.advance() orelse return null;
 
     if (parser.current_token.tag == .string_literal) {
@@ -295,7 +295,7 @@ fn parseSpecifierParts(parser: *Parser) Error!?SpecifierParts {
     var parts: SpecifierParts = .{ .name = first, .name_token = first_token };
 
     // parseTypeSpecifierTail may consume the rename
-    const tail = if (parser.tree.isTs() and
+    const tail = if (parser.isTs() and
         first_token.tag == .type and
         parser.tree.data(first) == .identifier_name)
         try parseTypeSpecifierTail(parser, &parts, first) orelse return null
@@ -379,7 +379,7 @@ fn canStartModuleExportName(tag: TokenTag) bool {
 
 pub fn parseExportDeclaration(parser: *Parser) Error!?ast.NodeIndex {
     std.debug.assert(parser.current_token.tag == .@"export");
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
     const start = parser.current_token.span.start;
     try parser.advance() orelse return null;
 
@@ -527,7 +527,7 @@ fn parseExportDefaultPart(parser: *Parser) Error!?DefaultExportPart {
         return .{ .declaration = declaration, .needs_semicolon = false };
     }
 
-    if (parser.tree.isTs()) {
+    if (parser.isTs()) {
         if (tag == .abstract and class.isAbstractClassNext(parser)) {
             const abstract_start = parser.current_token.span.start;
             try parser.advance() orelse return null;
@@ -627,7 +627,7 @@ fn parseExportNamedFromClause(
 }
 
 fn parseExportWithDeclaration(parser: *Parser, start: u32) Error!?ast.NodeIndex {
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
 
     if (is_ts and ts.isStartOfTsDeclaration(parser)) {
         const declaration = try ts.parseTsDeclaration(parser) orelse return null;
@@ -737,7 +737,7 @@ pub fn parseExportDecorated(parser: *Parser, decorators: ast.IndexRange) Error!?
     } else decorators;
 
     if (parser.current_token.tag != .class and
-        !(parser.tree.isTs() and class.isClassModifiersNext(parser)))
+        !(parser.isTs() and class.isClassModifiersNext(parser)))
     {
         try parser.reportExpected(parser.current_token.span, "Expected 'class' keyword", .{});
         return null;

@@ -104,7 +104,7 @@ pub fn parseVariableDeclarator(
     var annotated = false;
     var end = id_span.end;
 
-    if (parser.tree.isTs()) {
+    if (parser.isTs()) {
         if (parser.current_token.tag == .logical_not and
             !parser.current_token.hasLineTerminatorBefore())
         {

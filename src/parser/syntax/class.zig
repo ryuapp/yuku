@@ -41,7 +41,7 @@ pub fn parseClassDecorated(
         parser.current_token.tag == .abstract or
         parser.current_token.tag == .declare);
     const start = start_from_param orelse parser.current_token.span.start;
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
 
     // the modifiers after decorators or `export default`, as in `@dec abstract declare class`
     var is_abstract = options.is_abstract;
@@ -173,7 +173,7 @@ pub inline fn isAbstractClassNext(parser: *Parser) bool {
 inline fn canStartClassName(parser: *Parser) bool {
     const tag = parser.current_token.tag;
     if (!tag.isIdentifierLike() or tag == .extends) return false;
-    if (parser.tree.isTs() and tag == .implements) {
+    if (parser.isTs() and tag == .implements) {
         return !parser.peekAhead().tag.isIdentifierLike();
     }
     return true;
@@ -212,7 +212,7 @@ fn parseClassBody(parser: *Parser) Error!?ast.NodeIndex {
 }
 
 fn parseClassElement(parser: *Parser) Error!?ast.NodeIndex {
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
     const element_start = parser.current_token.span.start;
     const decorators: ast.IndexRange = if (parser.current_token.tag == .at)
         try decorator.parseDecorators(parser) orelse return null
@@ -426,7 +426,7 @@ const ModifierStep = union(enum) {
 
 fn consumeModifier(parser: *Parser, modifiers: *Modifiers) Error!ModifierStep {
     const token = parser.current_token;
-    if (!isModifier(token.tag, parser.tree.isTs())) return .none;
+    if (!isModifier(token.tag, parser.isTs())) return .none;
 
     const next = parser.peekAhead();
 
@@ -559,7 +559,7 @@ fn parseMethodDefinition(
         parser.context.yield = saved_yield;
     }
 
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
     const func_start = parser.current_token.span.start;
 
     const type_parameters: ast.NodeIndex = if (is_ts)
@@ -673,7 +673,7 @@ fn parsePropertyDefinition(
     var end = parser.prev_token_end;
 
     var type_annotation: ast.NodeIndex = .null;
-    if (parser.tree.isTs() and parser.current_token.tag == .colon) {
+    if (parser.isTs() and parser.current_token.tag == .colon) {
         type_annotation = try ts.parseTypeAnnotation(parser) orelse return null;
         end = parser.tree.span(type_annotation).end;
     }
@@ -795,7 +795,7 @@ fn detectConstructorKind(
     computed: bool,
 ) Error!void {
     if (modifiers.is_static or computed) return;
-    const prop = ecmascript.propName(&parser.tree, key) orelse return;
+    const prop = ecmascript.propName(parser.tree, key) orelse return;
     if (!prop.eql("constructor")) return;
 
     switch (modifiers.kind) {
@@ -856,7 +856,7 @@ fn validateStaticPrototypeOrConstructor(
     key: ast.NodeIndex,
     kind: enum { method, field },
 ) Error!void {
-    const prop = ecmascript.propName(&parser.tree, key) orelse return;
+    const prop = ecmascript.propName(parser.tree, key) orelse return;
     if (prop.eql("prototype")) {
         try parser.report(
             prop.span,
@@ -873,7 +873,7 @@ fn validateStaticPrototypeOrConstructor(
 }
 
 fn validateFieldConstructor(parser: *Parser, key: ast.NodeIndex) Error!void {
-    const prop = ecmascript.propName(&parser.tree, key) orelse return;
+    const prop = ecmascript.propName(parser.tree, key) orelse return;
     if (!prop.eql("constructor")) return;
     try parser.report(
         prop.span,

@@ -129,10 +129,10 @@ pub const AttachedComment = struct {
     };
 };
 
-/// A parsed or programmatically built AST. All memory lives in one arena,
-/// so `deinit()` frees everything at once.
+/// A parsed or programmatically built AST backed by an owned or caller-owned arena.
+/// `deinit()` releases an owned arena. A borrowed arena retains its caller-owned lifetime.
 pub const Tree = struct {
-    /// The `program` node.
+    /// The program or expression root. A null expression root is empty or failed.
     root: NodeIndex = undefined,
     nodes: NodeList = .empty,
     /// Child lists of all nodes, resolved with `extra()`.
@@ -146,10 +146,14 @@ pub const Tree = struct {
     attached_comments: []const AttachedComment = &.{},
     /// Prefix sums into `attached_comments`, `nodes.len + 1` entries long.
     attached_comment_offsets: []const u32 = &.{},
-    /// Every consumed token in source order, ending with `eof`. Empty unless
-    /// `Options.tokens` is set.
+    /// Every consumed token in source order. Program parses append EOF.
+    /// Expression parses exclude the following delimiter. Empty unless tokens are enabled.
     tokens: []const Token = &.{},
-    arena: std.heap.ArenaAllocator,
+    arena: ?std.heap.ArenaAllocator = null,
+    borrowed_allocator: ?std.mem.Allocator = null,
+    token_buffer: std.ArrayList(Token) = .empty,
+    active_expression_depth: u16 = 0,
+    flat_comments: std.ArrayList(Comment) = .empty,
     /// Empty for trees built with `initEmpty()`.
     source: []const u8 = "",
     strings: StringPool = .{},
@@ -165,6 +169,18 @@ pub const Tree = struct {
         };
     }
 
+    /// Uses caller-owned arena memory. `deinit` does not release this memory.
+    /// The caller keeps the arena and source alive for the complete document.
+    pub fn initInArena(arena_allocator: std.mem.Allocator, source: []const u8) Tree {
+        std.debug.assert(source.len <= std.math.maxInt(u32));
+        return .{
+            .root = .null,
+            .borrowed_allocator = arena_allocator,
+            .source = source,
+            .strings = .{ .source = source },
+        };
+    }
+
     /// Creates a tree without source text, for building an AST with
     /// `addString()`.
     pub fn initEmpty(child_allocator: std.mem.Allocator) Tree {
@@ -175,11 +191,19 @@ pub const Tree = struct {
 
     /// Frees all memory owned by this tree.
     pub fn deinit(self: *const Tree) void {
-        self.arena.deinit();
+        if (self.arena) |arena| arena.deinit();
     }
 
     pub inline fn allocator(self: *Tree) std.mem.Allocator {
-        return self.arena.allocator();
+        std.debug.assert((self.arena == null) != (self.borrowed_allocator == null));
+        if (self.arena) |*arena| return arena.allocator();
+        return self.borrowed_allocator.?;
+    }
+
+    /// Returns the allocator for temporary work outside an owned arena.
+    pub fn scratchAllocator(self: *const Tree) std.mem.Allocator {
+        if (self.arena) |arena| return arena.child_allocator;
+        return self.borrowed_allocator.?;
     }
 
     pub inline fn isTs(self: *const Tree) bool {
@@ -209,7 +233,7 @@ pub const Tree = struct {
 
     /// Appends a diagnostic to the tree.
     pub fn addDiagnostic(self: *Tree, diag: Diagnostic) error{OutOfMemory}!void {
-        try self.diagnostics.append(self.arena.allocator(), diag);
+        try self.diagnostics.append(self.allocator(), diag);
     }
 
     /// Returns the data for the node at the given index.
@@ -279,7 +303,7 @@ pub const Tree = struct {
         if (self.nodes.len < self.nodes.capacity) {
             self.nodes.appendAssumeCapacity(entry);
         } else {
-            try self.nodes.append(self.arena.allocator(), entry);
+            try self.nodes.append(self.allocator(), entry);
         }
         return index;
     }
@@ -291,7 +315,7 @@ pub const Tree = struct {
         if (self.extras.items.len + children.len <= self.extras.capacity) {
             self.extras.appendSliceAssumeCapacity(children);
         } else {
-            try self.extras.appendSlice(self.arena.allocator(), children);
+            try self.extras.appendSlice(self.allocator(), children);
         }
         return .{ .start = start, .len = @intCast(children.len) };
     }
@@ -304,7 +328,7 @@ pub const Tree = struct {
     /// Interns `str` in the string pool and returns its `String`. Use for text
     /// that is not in the source, such as escaped or synthesized names.
     pub fn addString(self: *Tree, str: []const u8) error{OutOfMemory}!String {
-        return self.strings.addString(self.arena.allocator(), str);
+        return self.strings.addString(self.allocator(), str);
     }
 
     /// Returns the text of a `String`.
