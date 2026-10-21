@@ -117,7 +117,7 @@ fn parseJsxOpeningElement(
     const name = try parseJsxElementName(parser) orelse return null;
 
     var type_arguments: ast.NodeIndex = .null;
-    if (parser.tree.isTs() and ts.isAngleOpen(parser.current_token.tag)) {
+    if (parser.isTs() and ts.isAngleOpen(parser.current_token.tag)) {
         parser.setLexerMode(.normal);
         type_arguments = try ts.parseTypeArguments(parser);
         parser.setLexerMode(.jsx_tag);
@@ -198,7 +198,7 @@ fn parseJsxClosingElement(
 }
 
 fn jsxNamesMatch(parser: *const Parser, opening: ast.NodeIndex, closing: ast.NodeIndex) bool {
-    const tree = &parser.tree;
+    const tree = parser.tree;
     var a = opening;
     var b = closing;
     while (true) switch (tree.data(a)) {

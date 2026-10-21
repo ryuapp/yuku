@@ -22,7 +22,7 @@ pub const Modifiers = struct {
 };
 
 pub fn isStartOfTsDeclaration(parser: *Parser) bool {
-    if (!parser.tree.isTs()) return false;
+    if (!parser.isTs()) return false;
 
     var peek = parser.beginPeek();
     defer peek.end();

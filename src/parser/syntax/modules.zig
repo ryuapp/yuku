@@ -19,7 +19,7 @@ const dialect = @import("../dialect.zig");
 pub fn parseImportDeclaration(parser: *Parser, start_from_param: ?u32) Error!?ast.NodeIndex {
     std.debug.assert(parser.current_token.tag == .import);
     const start = start_from_param orelse parser.current_token.span.start;
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
     try parser.advance() orelse return null;
 
     if (parser.current_token.tag == .string_literal) {
@@ -256,7 +256,7 @@ fn parseSpecifierParts(parser: *Parser) Error!?SpecifierParts {
 
     var parts: SpecifierParts = .{ .name = first, .name_token = first_token };
 
-    if (parser.tree.isTs() and
+    if (parser.isTs() and
         first_token.tag == .type and
         parser.tree.data(first) == .identifier_name)
     {
@@ -336,7 +336,7 @@ fn canStartModuleExportName(tag: TokenTag) bool {
 
 pub fn parseExportDeclaration(parser: *Parser) Error!?ast.NodeIndex {
     std.debug.assert(parser.current_token.tag == .@"export");
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
     const start = parser.current_token.span.start;
     try parser.advance() orelse return null;
 
@@ -456,7 +456,7 @@ fn parseExportDefaultPart(parser: *Parser) Error!?DefaultExportPart {
             break :blk try decorator.parseDecoratedClass(parser, .{ .is_default_export = true });
         }
 
-        if (parser.tree.isTs()) {
+        if (parser.isTs()) {
             if (tag == .abstract and class.isAbstractClassNext(parser)) {
                 try parser.advance() orelse return null;
                 break :blk try class.parseClass(parser, .{
@@ -541,7 +541,7 @@ fn parseExportNamedFromClause(
 }
 
 fn parseExportWithDeclaration(parser: *Parser, start: u32) Error!?ast.NodeIndex {
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
 
     if (is_ts and ts.isStartOfTsDeclaration(parser)) {
         const declaration = try ts.parseTsDeclaration(parser) orelse return null;
@@ -640,7 +640,7 @@ pub fn parseExportDecorated(parser: *Parser, decorators: ast.IndexRange) Error!?
     } else decorators;
 
     if (parser.current_token.tag != .class and
-        !(parser.tree.isTs() and class.isClassModifiersNext(parser)))
+        !(parser.isTs() and class.isClassModifiersNext(parser)))
     {
         try parser.reportExpected(parser.current_token.span, "Expected 'class' keyword", .{});
         return null;
