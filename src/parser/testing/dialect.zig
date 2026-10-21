@@ -64,12 +64,49 @@ pub fn statement(p: *Parser) Error!Claim {
 
 pub fn expression(p: *Parser) Error!Claim {
     const token = p.token();
-    if (token.tag == .at and std.mem.startsWith(u8, p.tree().source[token.span.end..], "<")) {
+    if (token.tag == .at and std.mem.startsWith(u8, p.source()[token.span.end..], "[")) {
+        return parseRange(p);
+    }
+    if (token.tag == .at and std.mem.startsWith(u8, p.source()[token.span.end..], "<")) {
         return parseMarked(p);
     }
     if (token.tag != .percent) return .decline;
     if (!try p.advance()) return .failed;
     return claimed(try p.addNode(.topic, &.{}, token.span));
+}
+
+fn parseRange(p: *Parser) Error!Claim {
+    const token = p.token();
+    std.debug.assert(token.tag == .at);
+    const source = p.source();
+    var cursor = token.span.end + 1;
+    const start = cursor;
+    var depth: u32 = 1;
+    while (cursor < p.range().end) : (cursor += 1) {
+        if (source[cursor] == '[') depth += 1;
+        if (source[cursor] == ']') depth -= 1;
+        if (depth == 0) break;
+    }
+    if (depth != 0) {
+        try p.report(token.span, "Expected ']' to close a range");
+        return .failed;
+    }
+    var options = p.parseOptions();
+    options.lang = .tsx;
+    const result = try p.parseExpressionRange(&.{
+        .options = options,
+        .start = start,
+        .end = cursor,
+    });
+    std.debug.assert(p.token().span.start == token.span.start);
+    if (result.metadata.diagnostics.len > 0) return .failed;
+    std.debug.assert(result.next.tag == .eof);
+    if (result.root == .null) return .failed;
+    if (!try p.seek(cursor + 1)) return .failed;
+    return claimed(try p.addNode(.interpolation, &.{result.root}, .{
+        .start = token.span.start,
+        .end = cursor + 1,
+    }));
 }
 
 pub fn operator(p: *Parser, left: NodeIndex, precedence: u8) Error!Claim {
@@ -506,4 +543,86 @@ test "a closing tag matches the dialect's tag by its expression, without comment
     var mismatched = try parseSource("const a = <{a}>x</{b}>;", true);
     defer mismatched.deinit();
     try testing.expect(mismatched.hasErrors());
+}
+
+test "dialect expression ranges nest and preserve generic arrows" {
+    const source = "const item = @[ @[<T,>(value: T) => value] ];";
+    var tree = try parseSource(source, true);
+    defer tree.deinit();
+    try expectClean(&tree);
+    const outer = tree.data(initOf(&tree, 0)).dialect;
+    const inner = tree.data(tree.extra(outer.children)[0]).dialect;
+    const arrow = tree.extra(inner.children)[0];
+    try testing.expect(tree.data(arrow) == .arrow_function_expression);
+    _ = try parser.semantic.analyze(&tree, .{ .check = true });
+    try expectClean(&tree);
+}
+
+test "dialect range speculation rewinds nodes and persistent children" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var tree = ast.Tree.initInArena(arena.allocator(), "@[name] + next}");
+    var session: parser.Parser = undefined;
+    try session.initInTree(&tree, .{ .lang = .jsx, .dialect = true }, .{
+        .start = 0,
+        .end = @intCast(tree.source.len),
+    });
+    defer session.deinit();
+    var facade: Parser = .{ .inner = &session };
+    const before = facade.checkpoint();
+    _ = try facade.parseExpression(ast.Precedence.Lowest) orelse
+        return error.MissingExpression;
+    try testing.expect(tree.extras.items.len > 0);
+    facade.rewind(before);
+    try testing.expectEqual(@as(u32, 0), tree.nodes.len);
+    try testing.expectEqual(@as(usize, 0), tree.extras.items.len);
+    try testing.expectEqual(.at, facade.token().tag);
+    const committed = try facade.parseExpression(ast.Precedence.Lowest) orelse
+        return error.MissingExpression;
+    try testing.expect(tree.data(committed) == .binary_expression);
+    try testing.expectEqual(.right_brace, facade.token().tag);
+    try expectClean(&tree);
+}
+
+test "dialect expression ranges inherit yield and await contexts" {
+    var tree = try parseSource(
+        "function* values() { return @[yield 1]; } " ++
+            "async function load() { return @[await task]; }",
+        true,
+    );
+    defer tree.deinit();
+    try expectClean(&tree);
+    var yields: u32 = 0;
+    var awaits: u32 = 0;
+    for (tree.nodes.items(.data)) |data| {
+        if (data == .yield_expression) yields += 1;
+        if (data == .await_expression) awaits += 1;
+    }
+    try testing.expectEqual(@as(u32, 1), yields);
+    try testing.expectEqual(@as(u32, 1), awaits);
+    var invalid = try parseSource("function plain() { return @[await task]; }", true);
+    defer invalid.deinit();
+    try testing.expect(invalid.hasErrors());
+}
+
+test "dialect range allocation failures release the owned arena" {
+    var completed = false;
+    for (0..128) |fail_index| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        const tree = parser.parse(failing.allocator(), "const item = @[/*a*/ @[value] + next];", .{
+            .lang = .jsx,
+            .dialect = true,
+            .comments = .attach,
+            .tokens = true,
+        }) catch continue;
+        defer tree.deinit();
+        try expectClean(&tree);
+        if (!failing.has_induced_failure) {
+            completed = true;
+            break;
+        }
+    }
+    try testing.expect(completed);
 }

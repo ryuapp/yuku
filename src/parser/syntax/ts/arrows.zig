@@ -64,7 +64,7 @@ pub fn parseArrow(
         false,
     ) orelse return null;
 
-    const has_return_type = parser.tree.isTs() and parser.current_token.tag == .colon;
+    const has_return_type = parser.isTs() and parser.current_token.tag == .colon;
     const return_type: ast.NodeIndex = if (has_return_type)
         try predicate.parseReturnTypeAnnotation(parser) orelse return null
     else

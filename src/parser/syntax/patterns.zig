@@ -69,7 +69,7 @@ pub fn parseBindingRestElement(parser: *Parser) Error!?ast.NodeIndex {
     var end = parser.tree.span(argument).end;
 
     var type_annotation: ast.NodeIndex = .null;
-    if (parser.tree.isTs() and parser.current_token.tag == .colon) {
+    if (parser.isTs() and parser.current_token.tag == .colon) {
         type_annotation = try ts.parseTypeAnnotation(parser) orelse return null;
         end = parser.tree.span(type_annotation).end;
     }

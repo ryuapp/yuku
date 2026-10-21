@@ -263,7 +263,7 @@ fn Walker(comptime C: type, comptime V: type, comptime options: Options) type {
         }
 
         fn deepWalk(self: *Self, ctx: *C, root: ast.NodeIndex) Allocator.Error!Step {
-            const gpa = ctx.tree.arena.child_allocator;
+            const gpa = ctx.tree.scratchAllocator();
             var steps: std.ArrayList(WalkStep) = .empty;
             defer steps.deinit(gpa);
 

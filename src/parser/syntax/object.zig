@@ -128,7 +128,7 @@ fn parseCoverProperty(parser: *Parser) Error!?ast.NodeIndex {
     const key_span = parser.tree.span(key);
 
     const is_method_start = parser.current_token.tag == .left_paren or
-        (parser.tree.isTs() and parser.current_token.tag == .less_than);
+        (parser.isTs() and parser.current_token.tag == .less_than);
 
     if (is_method_start) {
         return parseObjectMethodProperty(
@@ -335,7 +335,7 @@ fn parseObjectMethodProperty(
     defer parser.context.await = saved_await;
     defer parser.context.yield = saved_yield;
 
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
     const func_start = parser.current_token.span.start;
 
     const type_parameters: ast.NodeIndex = if (is_ts)

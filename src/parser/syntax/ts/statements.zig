@@ -24,7 +24,7 @@ pub const Modifiers = struct {
 };
 
 pub fn isStartOfTsDeclaration(parser: *Parser) bool {
-    if (!parser.tree.isTs()) return false;
+    if (!parser.isTs()) return false;
 
     var peek = parser.beginPeek();
     defer peek.end();
@@ -420,7 +420,7 @@ fn parseEnumMemberName(parser: *Parser) Error!?struct { ast.NodeIndex, bool } {
         )) return null;
 
         const span: ast.Span = .{ .start = start, .end = parser.prev_token_end };
-        switch (parseEnumMemberNameKind(&parser.tree, inner, parenthesized)) {
+        switch (parseEnumMemberNameKind(parser.tree, inner, parenthesized)) {
             .name => {},
             .numeric => try reportEnumMemberNumericName(parser, span),
             .computed => try parser.report(

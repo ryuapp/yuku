@@ -44,7 +44,7 @@ pub inline fn parseExpressionFrom(
     options: ParseExpressionOptions,
 ) Error!?ast.NodeIndex {
     var left = first;
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
 
     while (true) {
         if (comptime dialect.has(.operator)) {
@@ -128,16 +128,16 @@ fn parsePrefix(
     if (tag == .async) return parseAsyncFunctionOrArrow(parser, precedence, options);
 
     if (tag == .less_than) {
-        if (parser.tree.isTs()) {
+        if (parser.isTs()) {
             const start = parser.current_token.span.start;
             if (precedence <= Precedence.Assignment) {
                 if (try ts.tryParseGenericArrow(parser, false, start, options)) |arrow| {
                     return arrow;
                 }
             }
-            if (!parser.tree.isJsx()) return ts.parseTypeAssertion(parser);
+            if (!parser.isJsx()) return ts.parseTypeAssertion(parser);
         }
-        if (parser.tree.isJsx()) return jsx.parseJsxExpression(parser);
+        if (parser.isJsx()) return jsx.parseJsxExpression(parser);
     }
 
     return parsePrimaryExpression(parser, precedence);
@@ -162,7 +162,7 @@ fn parseInfix(
         return parseAssignmentExpression(parser, precedence, left, options);
     }
 
-    if (parser.tree.isTs()) {
+    if (parser.isTs()) {
         switch (tag) {
             .as, .satisfies => return ts.parseAsOrSatisfiesExpression(parser, left),
             .logical_not => if (!current.hasLineTerminatorBefore()) {
@@ -270,7 +270,7 @@ fn parseParenthesizedOrArrowFunction(
 ) Error!?ast.NodeIndex {
     const start = parser.current_token.span.start;
 
-    if (parser.tree.isTs() and precedence <= Precedence.Assignment) {
+    if (parser.isTs() and precedence <= Precedence.Assignment) {
         switch (ts.classifyArrowHead(parser)) {
             .yes => return ts.parseArrow(parser, false, start, options),
             .maybe => if (try ts.tryParseArrow(parser, false, start, options)) |arrow| {
@@ -356,7 +356,7 @@ fn parseAsyncFunctionOrArrow(
         return try parenthesized.coverToCallExpression(parser, cover, async_id);
     }
 
-    if (parser.tree.isTs() and next.tag == .less_than and precedence <= Precedence.Assignment) {
+    if (parser.isTs() and next.tag == .less_than and precedence <= Precedence.Assignment) {
         if (try ts.tryParseGenericArrow(parser, true, start, options)) |arrow| {
             try parser.reportIfEscapedKeyword(async_token);
             return arrow;
@@ -601,7 +601,7 @@ fn parseNewExpression(parser: *Parser) Error!?ast.NodeIndex {
                 break :blk tagged;
             },
             // `new (a?.b)!()` is NewExpression(TSNonNull(a?.b), ()), the `!` binds to the callee
-            .logical_not => if (parser.tree.isTs() and
+            .logical_not => if (parser.isTs() and
                 !parser.current_token.hasLineTerminatorBefore())
                 try ts.parseNonNullExpression(parser, callee) orelse return null
             else
@@ -615,7 +615,7 @@ fn parseNewExpression(parser: *Parser) Error!?ast.NodeIndex {
                 return null;
             },
             .less_than, .left_shift => blk: {
-                if (!parser.tree.isTs()) break;
+                if (!parser.isTs()) break;
                 type_arguments = try ts.tryParseTypeArgumentsInExpression(parser);
                 if (type_arguments == .null) break;
                 break :blk callee;
@@ -660,7 +660,7 @@ fn parseUpdateExpression(parser: *Parser, prefix: bool, left: ast.NodeIndex) Err
     else
         left;
     const argument_span = parser.tree.span(argument);
-    const unwrapped = static_semantics.unwrapParens(&parser.tree, argument);
+    const unwrapped = static_semantics.unwrapParens(parser.tree, argument);
 
     if (!isSimpleAssignmentTarget(parser, unwrapped)) {
         try parser.report(
@@ -787,7 +787,7 @@ fn parseAssignmentExpression(
         try grammar.expressionToPattern(parser, left, .assignable);
     } else if (isSimpleAssignmentTarget(parser, left)) {
         // mirror the paren-stripping that pattern conversion does for `=`
-        target = static_semantics.unwrapParens(&parser.tree, left);
+        target = static_semantics.unwrapParens(parser.tree, left);
     } else {
         @branchHint(.unlikely);
 
@@ -824,7 +824,7 @@ fn parseConditionalExpression(
     // the consequent is AssignmentExpression[+In]
     // an arrow return type can eat the ternary `:` in `c ? (a): T => b : d`,
     // so a consequent left without its `:` reparses with arrow return types restricted
-    const consequent = if (!parser.tree.isTs())
+    const consequent = if (!parser.isTs())
         try parseExpression(parser, precedence, .{}) orelse return null
     else consequent: {
         const before = parser.checkpoint();
@@ -1043,7 +1043,7 @@ pub fn parseTaggedTemplateExpression(
 }
 
 fn parseOptionalChain(parser: *Parser, left: ast.NodeIndex) Error!?ast.NodeIndex {
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
     const chain_start = parser.tree.span(left).start;
     try parser.advance() orelse return null;
 
@@ -1106,7 +1106,7 @@ fn parseOptionalChainElement(parser: *Parser, object_node: ast.NodeIndex) Error!
     }
 
     // only a generic call follows `?.` directly, `a?.<T>` alone or before a template rewinds
-    if (parser.tree.isTs() and ts.isAngleOpen(tag)) {
+    if (parser.isTs() and ts.isAngleOpen(tag)) {
         const checkpoint = parser.checkpoint();
         const type_arguments = try ts.tryParseTypeArgumentsInExpression(parser);
         if (type_arguments != .null and parser.current_token.tag == .left_paren) {
@@ -1159,7 +1159,7 @@ pub fn parseLeftHandSideExpression(
         else => try parsePrimaryExpression(parser, Precedence.Call) orelse return null,
     };
 
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
 
     while (true) {
         expr = switch (parser.current_token.tag) {

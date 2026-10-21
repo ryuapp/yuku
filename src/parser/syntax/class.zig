@@ -42,7 +42,7 @@ pub fn parseClassDecorated(
         parser.current_token.tag == .abstract or
         parser.current_token.tag == .declare);
     const start = start_from_param orelse parser.current_token.span.start;
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
 
     var is_abstract = options.is_abstract;
     var is_declare = options.is_declare;
@@ -170,7 +170,7 @@ pub inline fn isAbstractClassNext(parser: *Parser) bool {
 inline fn canStartClassName(parser: *Parser) bool {
     const tag = parser.current_token.tag;
     if (!tag.isIdentifierLike() or tag == .extends) return false;
-    if (parser.tree.isTs() and tag == .implements) {
+    if (parser.isTs() and tag == .implements) {
         return !parser.peekAhead().tag.isIdentifierLike();
     }
     return true;
@@ -209,7 +209,7 @@ fn parseClassBody(parser: *Parser) Error!?ast.NodeIndex {
 }
 
 fn parseClassElement(parser: *Parser) Error!?ast.NodeIndex {
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
     const element_start = parser.current_token.span.start;
     const decorators: ast.IndexRange = if (parser.current_token.tag == .at)
         try decorator.parseDecorators(parser) orelse return null
@@ -387,7 +387,7 @@ const Modifiers = struct {
 
 // a modifier word becomes the key when what follows cannot continue a modifier
 fn parseModifiers(parser: *Parser, modifiers: *Modifiers) Error!ast.NodeIndex {
-    while (isModifier(parser.current_token.tag, parser.tree.isTs())) {
+    while (isModifier(parser.current_token.tag, parser.isTs())) {
         const token = parser.current_token;
         const next = parser.peekAhead();
 
@@ -490,7 +490,7 @@ fn parseMethodDefinition(
     defer parser.context.await = saved_await;
     defer parser.context.yield = saved_yield;
 
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
     const func_start = parser.current_token.span.start;
 
     const type_parameters: ast.NodeIndex = if (is_ts) try ts.parseTypeParameters(parser) else .null;
@@ -579,7 +579,7 @@ fn parsePropertyDefinition(
     var end = parser.prev_token_end;
 
     var type_annotation: ast.NodeIndex = .null;
-    if (parser.tree.isTs() and parser.current_token.tag == .colon) {
+    if (parser.isTs() and parser.current_token.tag == .colon) {
         type_annotation = try ts.parseTypeAnnotation(parser) orelse return null;
         end = parser.tree.span(type_annotation).end;
     }
@@ -667,7 +667,7 @@ fn detectConstructor(parser: *Parser, key: ast.NodeIndex, modifiers: *Modifiers)
         return;
     }
     if (modifiers.is_static) return;
-    const prop = static_semantics.propName(&parser.tree, key) orelse return;
+    const prop = static_semantics.propName(parser.tree, key) orelse return;
     if (!prop.eql("constructor")) return;
 
     switch (modifiers.kind) {
@@ -729,7 +729,7 @@ fn validateElementName(
     is_static: bool,
     comptime kind: enum { method, field },
 ) Error!void {
-    const prop = static_semantics.propName(&parser.tree, key) orelse return;
+    const prop = static_semantics.propName(parser.tree, key) orelse return;
     if (is_static and prop.eql("prototype")) {
         try parser.report(
             prop.span,

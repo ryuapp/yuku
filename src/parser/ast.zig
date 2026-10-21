@@ -123,7 +123,6 @@ pub const Comment = struct {
     };
 };
 
-/// A parsed or built AST, all in one arena that `deinit()` frees at once.
 pub const Tree = struct {
     /// The `program` node.
     root: NodeIndex = .null,
@@ -135,9 +134,11 @@ pub const Tree = struct {
     comments: []const Comment = &.{},
     /// The comments of each node, read with `commentsOf()`.
     comment_index: CommentIndex = .{},
-    /// Every token in source order, ending with `eof`, when `Options.tokens` is set.
     tokens: []const Token = &.{},
-    arena: std.heap.ArenaAllocator,
+    arena: ?std.heap.ArenaAllocator = null,
+    borrowed_allocator: ?std.mem.Allocator = null,
+    token_buffer: std.ArrayList(Token) = .empty,
+    flat_comments: std.ArrayList(Comment) = .empty,
     source: []const u8 = "",
     strings: strings.ASTStringPool = .{},
     source_type: SourceType = .module,
@@ -152,13 +153,106 @@ pub const Tree = struct {
         };
     }
 
+    pub fn initInArena(arena_allocator: std.mem.Allocator, source: []const u8) Tree {
+        std.debug.assert(source.len <= std.math.maxInt(u32));
+        return .{
+            .root = .null,
+            .borrowed_allocator = arena_allocator,
+            .source = source,
+            .strings = .{ .source = source },
+        };
+    }
+
+    pub fn initEmpty(child_allocator: std.mem.Allocator) Tree {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(child_allocator),
+        };
+    }
+
     /// Frees all memory owned by this tree.
     pub fn deinit(self: *const Tree) void {
-        self.arena.deinit();
+        if (self.arena) |arena| arena.deinit();
     }
 
     pub inline fn allocator(self: *Tree) std.mem.Allocator {
-        return self.arena.allocator();
+        std.debug.assert((self.arena == null) != (self.borrowed_allocator == null));
+        if (self.arena) |*arena| return arena.allocator();
+        return self.borrowed_allocator.?;
+    }
+
+    pub fn scratchAllocator(self: *const Tree) std.mem.Allocator {
+        std.debug.assert((self.arena == null) != (self.borrowed_allocator == null));
+        if (self.arena) |arena| return arena.child_allocator;
+        return self.borrowed_allocator.?;
+    }
+
+    pub fn finalize(
+        self: *Tree,
+        root: NodeIndex,
+        options: FinalizeOptions,
+    ) error{OutOfMemory}!void {
+        std.debug.assert((self.arena == null) != (self.borrowed_allocator == null));
+        std.debug.assert(self.comment_index.chains.count() == 0);
+        if (root != .null) std.debug.assert(@backingInt(root) + 1 == self.nodes.len);
+        self.root = root;
+        if (self.borrowed_allocator != null) {
+            self.comments = self.flat_comments.items;
+            self.tokens = self.token_buffer.items;
+        }
+        if (self.tokens.len > 0) {
+            std.debug.assert(self.tokens.len <= std.math.maxInt(u32));
+            const tokens = @constCast(self.tokens);
+            std.debug.assert(tokens[tokens.len - 1].tag == .eof);
+            var count: u32 = 0;
+            for (tokens) |token| {
+                if (token.tag == .eof) continue;
+                tokens[count] = token;
+                count += 1;
+            }
+            std.debug.assert(count < tokens.len);
+            tokens[count] = Token.eof(@intCast(self.source.len));
+            self.tokens = tokens[0 .. count + 1];
+            if (self.token_buffer.items.ptr == self.tokens.ptr) {
+                self.token_buffer.shrinkRetainingCapacity(self.tokens.len);
+            }
+        }
+        treeSortMetadata(Comment, @constCast(self.comments));
+        treeSortMetadata(Token, @constCast(self.tokens));
+        if (options.attach_comments) {
+            if (root != .null) {
+                try @import("comments.zig").attach(self, @constCast(self.comments));
+            }
+        }
+        std.debug.assert(std.sort.isSorted(Comment, self.comments, {}, struct {
+            fn before(_: void, first: Comment, second: Comment) bool {
+                return first.span.start < second.span.start;
+            }
+        }.before));
+    }
+
+    pub const FinalizeOptions = struct {
+        attach_comments: bool = false,
+    };
+
+    fn treeSortMetadata(comptime T: type, items: []T) void {
+        std.debug.assert(items.len <= std.math.maxInt(u32));
+        const Order = struct {
+            fn before(_: void, first: T, second: T) bool {
+                if (first.span.start == second.span.start) {
+                    return first.span.end < second.span.end;
+                }
+                return first.span.start < second.span.start;
+            }
+        };
+        if (!std.sort.isSorted(T, items, {}, Order.before)) {
+            std.sort.heap(T, items, {}, Order.before);
+        }
+        var end: u32 = 0;
+        for (items) |item| {
+            std.debug.assert(end <= item.span.start);
+            end = item.span.end;
+        }
+        std.debug.assert(std.sort.isSorted(T, items, {}, Order.before));
     }
 
     pub inline fn isTs(self: *const Tree) bool {
@@ -183,7 +277,7 @@ pub const Tree = struct {
 
     /// Appends a diagnostic to the tree.
     pub fn addDiagnostic(self: *Tree, diag: Diagnostic) error{OutOfMemory}!void {
-        try self.diagnostics.append(self.arena.allocator(), diag);
+        try self.diagnostics.append(self.allocator(), diag);
     }
 
     /// Returns the data for the node at the given index.
@@ -255,7 +349,7 @@ pub const Tree = struct {
         if (self.nodes.len < self.nodes.capacity) {
             self.nodes.appendAssumeCapacity(entry);
         } else {
-            try self.nodes.append(self.arena.allocator(), entry);
+            try self.nodes.append(self.allocator(), entry);
         }
         return index;
     }
@@ -267,7 +361,7 @@ pub const Tree = struct {
         if (self.extras.items.len + children.len <= self.extras.capacity) {
             self.extras.appendSliceAssumeCapacity(children);
         } else {
-            try self.extras.appendSlice(self.arena.allocator(), children);
+            try self.extras.appendSlice(self.allocator(), children);
         }
         return .{ .start = start, .len = @intCast(children.len) };
     }
@@ -279,7 +373,7 @@ pub const Tree = struct {
 
     /// Interns text that is not in the source, such as a synthesized name.
     pub fn addString(self: *Tree, str: []const u8) error{OutOfMemory}!String {
-        return self.strings.addString(self.arena.allocator(), str);
+        return self.strings.addString(self.allocator(), str);
     }
 
     /// The text of a `String`.
@@ -299,12 +393,12 @@ pub const Tree = struct {
 
     /// Adds `comment` to `node`, after the comments it has.
     pub fn addComment(self: *Tree, node: NodeIndex, comment: Comment) error{OutOfMemory}!void {
-        try self.comment_index.add(self.arena.allocator(), self.comments.len, node, comment);
+        try self.comment_index.add(self.allocator(), self.comments.len, node, comment);
     }
 
     /// Gives the comments of `from` to `to`, or drops them when `to` is `.null`.
     pub fn moveComments(self: *Tree, from: NodeIndex, to: NodeIndex) error{OutOfMemory}!void {
-        try self.comment_index.move(self.arena.allocator(), from, to);
+        try self.comment_index.move(self.allocator(), from, to);
     }
 
     /// The source comments wholly within `range`, in source order.

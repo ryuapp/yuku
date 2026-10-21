@@ -57,7 +57,7 @@ pub fn parseFunction(
         );
     }
 
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
     const type_parameters: ast.NodeIndex = if (is_ts) try ts.parseTypeParameters(parser) else .null;
     const params = try parseFormalParameters(parser, .formal_parameters, false) orelse return null;
     const params_end = parser.tree.span(params).end;
@@ -185,7 +185,7 @@ pub fn parseFormalParameters(
     kind: ast.FormalParameterKind,
     allow_parameter_properties: bool,
 ) Error!?ast.NodeIndex {
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
     const start = parser.current_token.span.start;
     if (!try parser.expect(.left_paren, "Expected '(' to start parameter list", null)) return null;
 
@@ -269,7 +269,7 @@ fn parseFormalParameter(
     decorators: ast.IndexRange,
     start: u32,
 ) Error!?ast.NodeIndex {
-    const is_ts = parser.tree.isTs();
+    const is_ts = parser.isTs();
 
     if (is_ts and parser.current_token.tag == .this) return parseThisParameter(parser);
 

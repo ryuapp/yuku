@@ -176,16 +176,43 @@ pub const Parser = struct {
     inner: *core.Parser,
 
     pub inline fn tree(self: *const Parser) *ast.Tree {
-        return &self.inner.tree;
+        return self.inner.tree;
+    }
+
+    pub inline fn source(self: *const Parser) []const u8 {
+        return self.inner.source;
+    }
+
+    pub fn range(self: *const Parser) ast.Span {
+        std.debug.assert(self.inner.initialized);
+        std.debug.assert(self.inner.range_start <= self.inner.lexer.source.len);
+        return .{
+            .start = self.inner.range_start,
+            .end = @intCast(self.inner.lexer.source.len),
+        };
     }
 
     pub inline fn token(self: *const Parser) ast.Token {
         return self.inner.current_token;
     }
 
+    pub fn parseOptions(self: *const Parser) core.Options {
+        std.debug.assert(self.inner.initialized);
+        std.debug.assert(self.inner.current_token.span.end <= self.inner.lexer.source.len);
+        return .{
+            .source_type = self.inner.source_type,
+            .lang = self.inner.lang,
+            .preserve_parens = self.inner.preserve_parens,
+            .comments = self.inner.comment_mode,
+            .tokens = self.inner.collect_tokens,
+            .allow_return_outside_function = self.inner.allow_return_outside_function,
+            .dialect = self.inner.dialect,
+        };
+    }
+
     /// Lexes the token at or after `offset` in the current mode, without moving or reporting.
     pub fn tokenAt(self: *const Parser, offset: u32) ast.Token {
-        std.debug.assert(offset <= self.inner.source.len);
+        std.debug.assert(offset <= self.inner.lexer.source.len);
         var peek = self.inner.beginPeek();
         defer peek.end();
         self.inner.lexer.rewindTo(offset);
@@ -209,7 +236,7 @@ pub const Parser = struct {
 
     /// Makes the token at `offset` current, as a JSX child that parses tokens needs.
     pub fn seek(self: *const Parser, offset: u32) Error!bool {
-        std.debug.assert(offset <= self.inner.source.len);
+        std.debug.assert(offset <= self.inner.lexer.source.len);
         std.debug.assert(offset >= self.inner.current_token.span.start);
         self.inner.lexer.rewindTo(offset);
         const empty: ast.Token = .{ .span = .{ .start = offset, .end = offset }, .tag = .jsx_text };
@@ -242,10 +269,51 @@ pub const Parser = struct {
         return expressions.parseExpression(self.inner, precedence, .{});
     }
 
+    pub fn parseExpressionRange(
+        self: *const Parser,
+        options: *const core.ExpressionOptions,
+    ) Error!core.RangeResult {
+        const end = options.end orelse @as(u32, @intCast(self.inner.source.len));
+        const saved = try self.inner.enterRange(.{
+            .start = options.start,
+            .end = end,
+        }, options.options);
+        defer self.inner.leaveRange(&saved);
+        self.inner.context = options.context orelse saved.context;
+        const root = try self.inner.parseDelimitedExpression(options);
+        const result: core.RangeResult = .{
+            .root = root,
+            .end = self.inner.prev_token_end,
+            .next = self.inner.current_token,
+            .metadata = self.inner.metadata(),
+        };
+        std.debug.assert(result.end >= options.start);
+        std.debug.assert(result.next.span.end <= end);
+        return result;
+    }
+
+    pub fn parseProgramRange(
+        self: *const Parser,
+        span: ast.Span,
+        options: core.Options,
+    ) Error!core.RangeResult {
+        const saved = try self.inner.enterRange(span, options);
+        defer self.inner.leaveRange(&saved);
+        const root = try self.inner.parseProgramNode();
+        std.debug.assert(self.inner.current_token.tag == .eof);
+        std.debug.assert(self.tree().span(root).start == span.start);
+        return .{
+            .root = root,
+            .end = self.inner.prev_token_end,
+            .next = self.inner.current_token,
+            .metadata = self.inner.metadata(),
+        };
+    }
+
     /// Parses an identifier, array, or object pattern, with its type annotation in TypeScript.
     pub fn parseBindingPattern(self: *const Parser) Error!?ast.NodeIndex {
         const pattern = try patterns.parseBindingPattern(self.inner) orelse return null;
-        if (!self.inner.tree.isTs() or self.inner.current_token.tag != .colon) return pattern;
+        if (!self.inner.isTs() or self.inner.current_token.tag != .colon) return pattern;
         return ts.parsePatternTypeAnnotation(self.inner, pattern);
     }
 

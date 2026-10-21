@@ -283,7 +283,7 @@ fn validateForInOfDeclarators(
     for (parser.tree.extra(declarators)) |declarator| {
         const data = parser.tree.data(declarator).variable_declarator;
         if (data.init == .null) continue;
-        if (static_semantics.isAnnexBForInHead(&parser.tree, kind, data.id, tag == .in)) continue;
+        if (static_semantics.isAnnexBForInHead(parser.tree, kind, data.id, tag == .in)) continue;
 
         try parser.report(
             parser.tree.span(declarator),
